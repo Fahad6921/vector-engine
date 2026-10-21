@@ -1,0 +1,11 @@
+[package]
+name = "vecengine"
+description = "Core index structures for vector-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
