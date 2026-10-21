@@ -1,0 +1,22 @@
+# Private planning
+PLAN.md
+
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.so
+*.egg-info/
+
+# Datasets and local benchmark output
+/data/
+/bench/results/raw/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
