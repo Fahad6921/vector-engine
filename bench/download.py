@@ -18,7 +18,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-BASE_URL = "http://ann-benchmarks.com"
+BASE_URL = "https://ann-benchmarks.com"
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DEFAULT = ["sift-128-euclidean", "glove-100-angular"]
 
@@ -32,10 +32,17 @@ def write_vecs(path: Path, arr: np.ndarray) -> None:
     out.tofile(path)
 
 
-def progress(blocks: int, block_size: int, total: int) -> None:
-    done = min(blocks * block_size, total)
-    sys.stdout.write(f"\r  {done / 1e6:7.1f} / {total / 1e6:.1f} MB")
-    sys.stdout.flush()
+def download(url: str, dest: Path) -> None:
+    # The server rejects urllib's default User-Agent with a 403.
+    req = urllib.request.Request(url, headers={"User-Agent": "vector-engine-bench"})
+    with urllib.request.urlopen(req) as resp, open(dest, "wb") as out:
+        total = int(resp.headers.get("Content-Length", 0))
+        done = 0
+        while chunk := resp.read(1 << 20):
+            out.write(chunk)
+            done += len(chunk)
+            sys.stdout.write(f"\r  {done / 1e6:7.1f} / {total / 1e6:.1f} MB")
+            sys.stdout.flush()
 
 
 def fetch(name: str) -> None:
@@ -49,7 +56,7 @@ def fetch(name: str) -> None:
     if not h5_path.exists():
         print(f"{name}: downloading")
         tmp = h5_path.with_suffix(".part")
-        urllib.request.urlretrieve(f"{BASE_URL}/{name}.hdf5", tmp, progress)
+        download(f"{BASE_URL}/{name}.hdf5", tmp)
         tmp.rename(h5_path)
         print()
 
