@@ -79,10 +79,44 @@ impl FlatIndex {
     }
 
     /// Searches many queries in parallel. `queries` is row-major.
+    ///
+    /// Searching one query at a time streams the whole dataset from RAM per query,
+    /// which makes it memory-bandwidth bound. Instead each task takes a block of
+    /// queries and walks the data in cache-sized blocks, scoring every query in the
+    /// block before moving on, so each byte of data is loaded once per query block.
     pub fn search_batch(&self, queries: &[f32], k: usize) -> Vec<Vec<Neighbor>> {
+        const QUERY_BLOCK: usize = 32;
+        const DATA_BLOCK: usize = 2048;
+
+        assert_eq!(
+            queries.len() % self.dim,
+            0,
+            "queries are not a whole number of vectors"
+        );
         queries
-            .par_chunks_exact(self.dim)
-            .map(|q| self.search(q, k))
+            .par_chunks(QUERY_BLOCK * self.dim)
+            .flat_map_iter(|block| {
+                let qs: Vec<Vec<f32>> = block
+                    .chunks_exact(self.dim)
+                    .map(|q| {
+                        let mut q = q.to_vec();
+                        if self.metric.needs_normalize() {
+                            normalize(&mut q);
+                        }
+                        q
+                    })
+                    .collect();
+                let mut tops: Vec<TopK> = qs.iter().map(|_| TopK::new(k)).collect();
+                for (b, data) in self.data.chunks(DATA_BLOCK * self.dim).enumerate() {
+                    let base = b * DATA_BLOCK;
+                    for (q, top) in qs.iter().zip(&mut tops) {
+                        for (j, v) in data.chunks_exact(self.dim).enumerate() {
+                            top.push(Neighbor::new((base + j) as u32, self.metric.distance(q, v)));
+                        }
+                    }
+                }
+                tops.into_iter().map(TopK::into_sorted_vec)
+            })
             .collect()
     }
 }
