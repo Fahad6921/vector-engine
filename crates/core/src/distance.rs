@@ -218,8 +218,11 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn close(simd: f32, reference: f32) -> bool {
-        (simd - reference).abs() <= 1e-4 * reference.abs().max(1.0)
+    /// Summation-order rounding error scales with the magnitude of the terms, not
+    /// of the result: a dot product whose terms cancel to ~0 can still be off by
+    /// eps * sum(|a_i * b_i|). So the tolerance is relative to that sum.
+    fn close(simd: f32, reference: f32, magnitude: f32) -> bool {
+        (simd - reference).abs() <= 1e-5 * magnitude.max(1.0)
     }
 
     fn pair() -> impl Strategy<Value = (Vec<f32>, Vec<f32>)> {
@@ -234,12 +237,14 @@ mod tests {
     proptest! {
         #[test]
         fn l2_matches_scalar((a, b) in pair()) {
-            prop_assert!(close(l2_sq(&a, &b), scalar::l2_sq(&a, &b)));
+            let expected = scalar::l2_sq(&a, &b);
+            prop_assert!(close(l2_sq(&a, &b), expected, expected));
         }
 
         #[test]
         fn dot_matches_scalar((a, b) in pair()) {
-            prop_assert!(close(dot(&a, &b), scalar::dot(&a, &b)));
+            let magnitude: f32 = a.iter().zip(&b).map(|(x, y)| (x * y).abs()).sum();
+            prop_assert!(close(dot(&a, &b), scalar::dot(&a, &b), magnitude));
         }
     }
 
