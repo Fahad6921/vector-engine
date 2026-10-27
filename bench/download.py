@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import http.client
 import sys
 import urllib.request
 from pathlib import Path
@@ -32,17 +33,31 @@ def write_vecs(path: Path, arr: np.ndarray) -> None:
     out.tofile(path)
 
 
-def download(url: str, dest: Path) -> None:
+def download(url: str, dest: Path, attempts: int = 10) -> None:
+    """Download with resume. Connections to the host sometimes drop without an error."""
     # The server rejects urllib's default User-Agent with a 403.
-    req = urllib.request.Request(url, headers={"User-Agent": "vector-engine-bench"})
-    with urllib.request.urlopen(req) as resp, open(dest, "wb") as out:
-        total = int(resp.headers.get("Content-Length", 0))
-        done = 0
-        while chunk := resp.read(1 << 20):
-            out.write(chunk)
-            done += len(chunk)
-            sys.stdout.write(f"\r  {done / 1e6:7.1f} / {total / 1e6:.1f} MB")
-            sys.stdout.flush()
+    headers = {"User-Agent": "vector-engine-bench"}
+    head = urllib.request.Request(url, headers=headers, method="HEAD")
+    with urllib.request.urlopen(head) as resp:
+        total = int(resp.headers["Content-Length"])
+
+    for _ in range(attempts):
+        done = dest.stat().st_size if dest.exists() else 0
+        if done >= total:
+            break
+        req = urllib.request.Request(url, headers={**headers, "Range": f"bytes={done}-"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp, open(dest, "ab") as out:
+                while chunk := resp.read(1 << 20):
+                    out.write(chunk)
+                    done += len(chunk)
+                    sys.stdout.write(f"\r  {done / 1e6:7.1f} / {total / 1e6:.1f} MB")
+                    sys.stdout.flush()
+        except (OSError, http.client.HTTPException) as e:
+            print(f"\n  connection dropped ({e}), resuming")
+
+    if dest.stat().st_size != total:
+        raise RuntimeError(f"{url}: got {dest.stat().st_size} of {total} bytes")
 
 
 def fetch(name: str) -> None:
