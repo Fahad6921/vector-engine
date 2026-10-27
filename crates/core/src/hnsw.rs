@@ -7,11 +7,17 @@
 //! Neighbour lists are stored in flat fixed-stride arrays (`[count, ids...]`)
 //! rather than per-node `Vec`s: no pointer chasing, and the layout can be written
 //! to disk and mmapped as-is.
+//!
+//! Builds run in parallel. Each node has its own lock, taken to read or modify its
+//! neighbour list during a build. The lists are atomics so that `search`, which can
+//! only run when no build is in progress (`&self` vs `&mut self`), reads them
+//! without locking; relaxed atomic loads compile to plain loads.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
+use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use crate::distance::{normalize, Metric};
@@ -36,6 +42,12 @@ impl Default for HnswParams {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Entry {
+    id: u32,
+    level: usize,
+}
+
 pub struct Hnsw {
     dim: usize,
     metric: Metric,
@@ -48,12 +60,13 @@ pub struct Hnsw {
     data: Vec<f32>,
     levels: Vec<u8>,
     /// Layer 0 links, stride `m0 + 1`.
-    links0: Vec<u32>,
+    links0: Vec<AtomicU32>,
     /// Links for layers 1..=level of each node, stride `m + 1` per layer.
-    upper: Vec<Vec<u32>>,
+    upper: Vec<Box<[AtomicU32]>>,
+    /// One lock per node, guarding its neighbour lists during builds.
+    locks: Vec<Mutex<()>>,
 
-    entry: Option<u32>,
-    max_level: usize,
+    entry: Option<Entry>,
     rng: SplitMix64,
     visited: Mutex<Vec<Visited>>,
 }
@@ -72,8 +85,8 @@ impl Hnsw {
             levels: Vec::new(),
             links0: Vec::new(),
             upper: Vec::new(),
+            locks: Vec::new(),
             entry: None,
-            max_level: 0,
             rng: SplitMix64(params.seed),
             visited: Mutex::new(Vec::new()),
         }
@@ -100,7 +113,7 @@ impl Hnsw {
     }
 
     pub fn max_level(&self) -> usize {
-        self.max_level
+        self.entry.map_or(0, |e| e.level)
     }
 
     pub fn vector(&self, id: u32) -> &[f32] {
@@ -108,65 +121,107 @@ impl Hnsw {
         &self.data[i..i + self.dim]
     }
 
-    /// Adds a row-major block of vectors. Ids continue from the current length.
-    pub fn add_batch(&mut self, data: &[f32]) {
-        assert_eq!(data.len() % self.dim, 0, "batch is not a whole number of vectors");
-        for v in data.chunks_exact(self.dim) {
-            self.add(v);
-        }
-    }
-
     /// Inserts one vector and returns its id.
     pub fn add(&mut self, v: &[f32]) -> u32 {
         assert_eq!(v.len(), self.dim, "vector has wrong dimension");
         let id = self.len() as u32;
-        let level = self.random_level();
+        self.add_batch(v);
+        id
+    }
 
-        let start = self.data.len();
-        self.data.extend_from_slice(v);
-        if self.metric.needs_normalize() {
-            normalize(&mut self.data[start..]);
+    /// Adds a row-major block of vectors, inserting them in parallel.
+    /// Ids continue from the current length.
+    pub fn add_batch(&mut self, data: &[f32]) {
+        assert_eq!(data.len() % self.dim, 0, "batch is not a whole number of vectors");
+        let start = self.len();
+        let n = data.len() / self.dim;
+        if n == 0 {
+            return;
         }
-        self.levels.push(level as u8);
-        self.links0.resize(self.links0.len() + self.m0 + 1, 0);
-        self.upper.push(vec![0; level * (self.params.m + 1)]);
 
-        let Some(mut ep) = self.entry else {
-            self.entry = Some(id);
-            self.max_level = level;
-            return id;
-        };
+        // Allocate everything up front so the parallel phase only needs &self.
+        // Levels are drawn sequentially, so they stay deterministic for a seed.
+        self.data.reserve(data.len());
+        for v in data.chunks_exact(self.dim) {
+            let s = self.data.len();
+            self.data.extend_from_slice(v);
+            if self.metric.needs_normalize() {
+                normalize(&mut self.data[s..]);
+            }
+            let level = self.random_level();
+            self.levels.push(level as u8);
+            self.upper.push(
+                (0..level * (self.params.m + 1))
+                    .map(|_| AtomicU32::new(0))
+                    .collect(),
+            );
+            self.locks.push(Mutex::new(()));
+        }
+        self.links0
+            .resize_with((start + n) * (self.m0 + 1), || AtomicU32::new(0));
 
-        let q = self.vector(id).to_vec();
-        let mut ep_dist = self.dist(&q, ep);
-        for layer in (level + 1..=self.max_level).rev() {
-            (ep, ep_dist) = self.greedy_closest(&q, ep, ep_dist, layer);
+        let mut first = start;
+        let entry = *self.entry.get_or_insert_with(|| {
+            first += 1;
+            Entry {
+                id: start as u32,
+                level: self.levels[start] as usize,
+            }
+        });
+
+        let entry = Mutex::new(entry);
+        let this = &*self;
+        (first..start + n)
+            .into_par_iter()
+            .for_each(|id| this.insert(id as u32, &entry));
+        self.entry = Some(entry.into_inner());
+    }
+
+    /// Links an already-allocated node into the graph (Algorithm 1).
+    fn insert(&self, id: u32, entry: &Mutex<Entry>) {
+        let level = self.levels[id as usize] as usize;
+
+        // A node that will become the new top level holds the entry lock for its
+        // whole insert, so no one else can see a half-linked entry point.
+        let mut guard = Some(entry.lock());
+        let top = **guard.as_ref().unwrap();
+        if level <= top.level {
+            guard = None;
+        }
+
+        let q = self.vector(id);
+        let mut buf = Vec::with_capacity(self.m0);
+        let (mut ep, mut ep_dist) = (top.id, self.dist(q, top.id));
+        for layer in (level + 1..=top.level).rev() {
+            (ep, ep_dist) = self.greedy_closest(q, ep, ep_dist, layer, true, &mut buf);
         }
 
         let mut eps = vec![Neighbor::new(ep, ep_dist)];
-        for layer in (0..=level.min(self.max_level)).rev() {
-            let candidates = self.search_layer(&q, &eps, self.params.ef_construction, layer);
+        for layer in (0..=level.min(top.level)).rev() {
+            let mut candidates = self.search_layer(q, &eps, self.params.ef_construction, layer, true);
+            candidates.retain(|c| c.id != id);
             let selected = self.select_neighbors(&candidates, self.params.m);
-            let ids: Vec<u32> = selected.iter().map(|n| n.id).collect();
-            self.set_links(id, layer, &ids);
+            {
+                let _lock = self.locks[id as usize].lock();
+                let ids: Vec<u32> = selected.iter().map(|n| n.id).collect();
+                self.write_links(id, layer, &ids);
+            }
             for n in &selected {
                 self.connect(n.id, id, n.distance, layer);
             }
             eps = candidates;
         }
 
-        if level > self.max_level {
-            self.max_level = level;
-            self.entry = Some(id);
+        if let Some(mut g) = guard {
+            *g = Entry { id, level };
         }
-        id
     }
 
     /// The `k` approximate nearest neighbours of `query`, closest first.
     /// `ef` is the search beam width; it is raised to `k` if smaller.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Neighbor> {
         assert_eq!(query.len(), self.dim, "query has wrong dimension");
-        let Some(mut ep) = self.entry else {
+        let Some(top) = self.entry else {
             return Vec::new();
         };
         let mut q = query.to_vec();
@@ -174,11 +229,12 @@ impl Hnsw {
             normalize(&mut q);
         }
 
-        let mut ep_dist = self.dist(&q, ep);
-        for layer in (1..=self.max_level).rev() {
-            (ep, ep_dist) = self.greedy_closest(&q, ep, ep_dist, layer);
+        let mut buf = Vec::with_capacity(self.m0);
+        let (mut ep, mut ep_dist) = (top.id, self.dist(&q, top.id));
+        for layer in (1..=top.level).rev() {
+            (ep, ep_dist) = self.greedy_closest(&q, ep, ep_dist, layer, false, &mut buf);
         }
-        let mut res = self.search_layer(&q, &[Neighbor::new(ep, ep_dist)], ef.max(k), 0);
+        let mut res = self.search_layer(&q, &[Neighbor::new(ep, ep_dist)], ef.max(k), 0, false);
         res.truncate(k);
         res
     }
@@ -202,49 +258,59 @@ impl Hnsw {
         self.metric.distance(q, self.vector(id))
     }
 
+    /// The raw `[count, ids...]` slot for a node on a layer.
     #[inline]
-    fn links(&self, id: u32, layer: usize) -> &[u32] {
-        let list = if layer == 0 {
+    fn list(&self, id: u32, layer: usize) -> &[AtomicU32] {
+        if layer == 0 {
             let base = id as usize * (self.m0 + 1);
             &self.links0[base..base + self.m0 + 1]
         } else {
             let stride = self.params.m + 1;
             let base = (layer - 1) * stride;
             &self.upper[id as usize][base..base + stride]
-        };
-        &list[1..1 + list[0] as usize]
+        }
     }
 
-    fn set_links(&mut self, id: u32, layer: usize, ids: &[u32]) {
-        let list = if layer == 0 {
-            let base = id as usize * (self.m0 + 1);
-            &mut self.links0[base..base + self.m0 + 1]
-        } else {
-            let stride = self.params.m + 1;
-            let base = (layer - 1) * stride;
-            &mut self.upper[id as usize][base..base + stride]
-        };
+    /// Copies a node's neighbours into `buf`, taking the node's lock if `lock`.
+    #[inline]
+    fn read_links(&self, id: u32, layer: usize, lock: bool, buf: &mut Vec<u32>) {
+        let list = self.list(id, layer);
+        let _lock = lock.then(|| self.locks[id as usize].lock());
+        let n = list[0].load(Relaxed) as usize;
+        buf.clear();
+        buf.extend(list[1..1 + n].iter().map(|a| a.load(Relaxed)));
+    }
+
+    /// Overwrites a node's neighbours. Caller must hold the node's lock.
+    fn write_links(&self, id: u32, layer: usize, ids: &[u32]) {
+        let list = self.list(id, layer);
         debug_assert!(ids.len() < list.len());
-        list[0] = ids.len() as u32;
-        list[1..1 + ids.len()].copy_from_slice(ids);
+        for (slot, &n) in list[1..].iter().zip(ids) {
+            slot.store(n, Relaxed);
+        }
+        list[0].store(ids.len() as u32, Relaxed);
     }
 
     /// Adds a link `from -> to`. If `from` is already full, its list is re-pruned
     /// with the selection heuristic, which may drop the new link or an old one.
-    fn connect(&mut self, from: u32, to: u32, distance: f32, layer: usize) {
+    fn connect(&self, from: u32, to: u32, distance: f32, layer: usize) {
         let cap = if layer == 0 { self.m0 } else { self.params.m };
-        let current = self.links(from, layer);
-        if current.len() < cap {
-            let mut ids = current.to_vec();
-            ids.push(to);
-            self.set_links(from, layer, &ids);
+        let _lock = self.locks[from as usize].lock();
+        let list = self.list(from, layer);
+        let n = list[0].load(Relaxed) as usize;
+        if n < cap {
+            list[1 + n].store(to, Relaxed);
+            list[0].store(n as u32 + 1, Relaxed);
             return;
         }
 
         let base = self.vector(from);
-        let mut candidates: Vec<Neighbor> = current
+        let mut candidates: Vec<Neighbor> = list[1..1 + n]
             .iter()
-            .map(|&id| Neighbor::new(id, self.metric.distance(base, self.vector(id))))
+            .map(|a| {
+                let id = a.load(Relaxed);
+                Neighbor::new(id, self.metric.distance(base, self.vector(id)))
+            })
             .collect();
         candidates.push(Neighbor::new(to, distance));
         candidates.sort_unstable();
@@ -253,7 +319,7 @@ impl Hnsw {
             .iter()
             .map(|n| n.id)
             .collect();
-        self.set_links(from, layer, &ids);
+        self.write_links(from, layer, &ids);
     }
 
     /// Neighbour selection heuristic (Algorithm 4 in the paper).
@@ -280,10 +346,19 @@ impl Hnsw {
     }
 
     /// Greedy walk on one layer: move to the closest neighbour until none is closer.
-    fn greedy_closest(&self, q: &[f32], mut ep: u32, mut ep_dist: f32, layer: usize) -> (u32, f32) {
+    fn greedy_closest(
+        &self,
+        q: &[f32],
+        mut ep: u32,
+        mut ep_dist: f32,
+        layer: usize,
+        lock: bool,
+        buf: &mut Vec<u32>,
+    ) -> (u32, f32) {
         loop {
             let mut moved = false;
-            for &n in self.links(ep, layer) {
+            self.read_links(ep, layer, lock, buf);
+            for &n in buf.iter() {
                 let d = self.dist(q, n);
                 if d < ep_dist {
                     ep = n;
@@ -298,9 +373,17 @@ impl Hnsw {
     }
 
     /// Beam search on one layer (Algorithm 2). Returns up to `ef` nodes, closest first.
-    fn search_layer(&self, q: &[f32], eps: &[Neighbor], ef: usize, layer: usize) -> Vec<Neighbor> {
-        let mut visited = self.visited.lock().unwrap().pop().unwrap_or_default();
+    fn search_layer(
+        &self,
+        q: &[f32],
+        eps: &[Neighbor],
+        ef: usize,
+        layer: usize,
+        lock: bool,
+    ) -> Vec<Neighbor> {
+        let mut visited = self.visited.lock().pop().unwrap_or_default();
         visited.reset(self.len());
+        let mut buf = Vec::with_capacity(self.m0);
 
         // Min-heap of nodes to expand; max-heap of the best `ef` found so far.
         let mut candidates: BinaryHeap<Reverse<Neighbor>> = BinaryHeap::with_capacity(ef * 2);
@@ -319,7 +402,8 @@ impl Hnsw {
             if c.distance > worst && results.len() >= ef {
                 break;
             }
-            for &n in self.links(c.id, layer) {
+            self.read_links(c.id, layer, lock, &mut buf);
+            for &n in &buf {
                 if !visited.insert(n) {
                     continue;
                 }
@@ -336,7 +420,7 @@ impl Hnsw {
             }
         }
 
-        self.visited.lock().unwrap().push(visited);
+        self.visited.lock().push(visited);
         results.into_sorted_vec()
     }
 }
@@ -401,37 +485,60 @@ mod tests {
         (0..n * dim).map(|_| rng.next_f64() as f32 * 2.0 - 1.0).collect()
     }
 
-    fn recall(metric: Metric) -> f64 {
-        let (n, dim, k) = (3000, 16, 10);
-        let data = random_data(n, dim, 1);
-        let queries = random_data(100, dim, 2);
-
-        let mut flat = FlatIndex::new(dim, metric);
-        flat.add_batch(&data);
-        let mut hnsw = Hnsw::new(dim, metric, HnswParams::default());
-        hnsw.add_batch(&data);
-
+    fn recall(index: &Hnsw, flat: &FlatIndex, queries: &[f32], k: usize) -> f64 {
+        let dim = index.dim();
         let mut hits = 0;
         for q in queries.chunks_exact(dim) {
             let truth: Vec<u32> = flat.search(q, k).iter().map(|n| n.id).collect();
-            hits += hnsw
+            hits += index
                 .search(q, k, 64)
                 .iter()
                 .filter(|n| truth.contains(&n.id))
                 .count();
         }
-        hits as f64 / (100 * k) as f64
+        hits as f64 / (queries.len() / dim * k) as f64
+    }
+
+    fn build_and_measure(metric: Metric) -> f64 {
+        let (n, dim) = (3000, 16);
+        let data = random_data(n, dim, 1);
+        let mut flat = FlatIndex::new(dim, metric);
+        flat.add_batch(&data);
+        let mut hnsw = Hnsw::new(dim, metric, HnswParams::default());
+        hnsw.add_batch(&data);
+        recall(&hnsw, &flat, &random_data(100, dim, 2), 10)
     }
 
     #[test]
     fn high_recall_l2() {
-        let r = recall(Metric::L2);
+        let r = build_and_measure(Metric::L2);
         assert!(r > 0.95, "recall {r}");
     }
 
     #[test]
     fn high_recall_cosine() {
-        let r = recall(Metric::Cosine);
+        let r = build_and_measure(Metric::Cosine);
+        assert!(r > 0.95, "recall {r}");
+    }
+
+    #[test]
+    fn incremental_batches_and_single_adds() {
+        let dim = 16;
+        let data = random_data(3000, dim, 5);
+        let mut flat = FlatIndex::new(dim, Metric::L2);
+        flat.add_batch(&data);
+
+        let mut hnsw = Hnsw::new(dim, Metric::L2, HnswParams::default());
+        let (a, rest) = data.split_at(1000 * dim);
+        let (b, c) = rest.split_at(1000 * dim);
+        hnsw.add_batch(a);
+        for v in b.chunks_exact(dim) {
+            hnsw.add(v);
+        }
+        hnsw.add_batch(c);
+        assert_eq!(hnsw.len(), 3000);
+
+        let r = recall(&hnsw, &flat, &random_data(100, dim, 6), 10);
         assert!(r > 0.95, "recall {r}");
     }
 
@@ -446,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn neighbour_lists_respect_caps() {
+    fn neighbour_lists_respect_caps_and_have_no_self_links() {
         let dim = 8;
         let mut index = Hnsw::new(
             dim,
@@ -457,10 +564,12 @@ mod tests {
             },
         );
         index.add_batch(&random_data(2000, dim, 3));
+        let mut buf = Vec::new();
         for id in 0..index.len() as u32 {
-            assert!(index.links(id, 0).len() <= 8);
-            for layer in 1..=index.levels[id as usize] as usize {
-                assert!(index.links(id, layer).len() <= 4);
+            for layer in 0..=index.levels[id as usize] as usize {
+                index.read_links(id, layer, false, &mut buf);
+                assert!(buf.len() <= if layer == 0 { 8 } else { 4 });
+                assert!(!buf.contains(&id), "node {id} links to itself");
             }
         }
     }
