@@ -9,3 +9,4 @@ repository.workspace = true
 [dependencies]
 
 [dev-dependencies]
+proptest = "1.12.0"
