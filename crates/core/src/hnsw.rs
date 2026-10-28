@@ -61,8 +61,10 @@ pub struct Hnsw {
     levels: Vec<u8>,
     /// Layer 0 links, stride `m0 + 1`.
     links0: Vec<AtomicU32>,
-    /// Links for layers 1..=level of each node, stride `m + 1` per layer.
-    upper: Vec<Box<[AtomicU32]>>,
+    /// Links for layers 1..=level of every node, concatenated. Node `i` owns
+    /// `upper[upper_offsets[i]..upper_offsets[i + 1]]`, stride `m + 1` per layer.
+    upper: Vec<AtomicU32>,
+    upper_offsets: Vec<u64>,
     /// One lock per node, guarding its neighbour lists during builds.
     locks: Vec<Mutex<()>>,
 
@@ -85,6 +87,7 @@ impl Hnsw {
             levels: Vec::new(),
             links0: Vec::new(),
             upper: Vec::new(),
+            upper_offsets: vec![0],
             locks: Vec::new(),
             entry: None,
             rng: SplitMix64(params.seed),
@@ -150,11 +153,9 @@ impl Hnsw {
             }
             let level = self.random_level();
             self.levels.push(level as u8);
-            self.upper.push(
-                (0..level * (self.params.m + 1))
-                    .map(|_| AtomicU32::new(0))
-                    .collect(),
-            );
+            let end = self.upper.len() + level * (self.params.m + 1);
+            self.upper.resize_with(end, || AtomicU32::new(0));
+            self.upper_offsets.push(end as u64);
             self.locks.push(Mutex::new(()));
         }
         self.links0
@@ -220,6 +221,18 @@ impl Hnsw {
     /// The `k` approximate nearest neighbours of `query`, closest first.
     /// `ef` is the search beam width; it is raised to `k` if smaller.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Neighbor> {
+        self.search_filtered(query, k, ef, |_| true)
+    }
+
+    /// Like `search`, but only ids for which `allowed(id)` is true are returned.
+    /// Used for deletes (tombstones) and metadata filters.
+    pub fn search_filtered<F: Fn(u32) -> bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        allowed: F,
+    ) -> Vec<Neighbor> {
         assert_eq!(query.len(), self.dim, "query has wrong dimension");
         let Some(top) = self.entry else {
             return Vec::new();
@@ -234,7 +247,8 @@ impl Hnsw {
         for layer in (1..=top.level).rev() {
             (ep, ep_dist) = self.greedy_closest(&q, ep, ep_dist, layer, false, &mut buf);
         }
-        let mut res = self.search_layer(&q, &[Neighbor::new(ep, ep_dist)], ef.max(k), 0, false);
+        let eps = [Neighbor::new(ep, ep_dist)];
+        let mut res = self.search_layer_filtered(&q, &eps, ef.max(k), 0, false, allowed);
         res.truncate(k);
         res
     }
@@ -266,8 +280,8 @@ impl Hnsw {
             &self.links0[base..base + self.m0 + 1]
         } else {
             let stride = self.params.m + 1;
-            let base = (layer - 1) * stride;
-            &self.upper[id as usize][base..base + stride]
+            let base = self.upper_offsets[id as usize] as usize + (layer - 1) * stride;
+            &self.upper[base..base + stride]
         }
     }
 
@@ -381,19 +395,39 @@ impl Hnsw {
         layer: usize,
         lock: bool,
     ) -> Vec<Neighbor> {
+        self.search_layer_filtered(q, eps, ef, layer, lock, |_| true)
+    }
+
+    /// Beam search where only nodes passing `allowed` can enter the results.
+    ///
+    /// Rejected nodes are still expanded: they are part of the graph's paths, and
+    /// skipping them would disconnect regions of allowed nodes. With very few
+    /// allowed nodes the results rarely fill, so the search ends up walking most of
+    /// the reachable graph; callers should fall back to brute force in that case.
+    fn search_layer_filtered<F: Fn(u32) -> bool>(
+        &self,
+        q: &[f32],
+        eps: &[Neighbor],
+        ef: usize,
+        layer: usize,
+        lock: bool,
+        allowed: F,
+    ) -> Vec<Neighbor> {
         let mut visited = self.visited.lock().pop().unwrap_or_default();
         visited.reset(self.len());
         let mut buf = Vec::with_capacity(self.m0);
 
-        // Min-heap of nodes to expand; max-heap of the best `ef` found so far.
+        // Min-heap of nodes to expand; max-heap of the best `ef` allowed nodes so far.
         let mut candidates: BinaryHeap<Reverse<Neighbor>> = BinaryHeap::with_capacity(ef * 2);
         let mut results: BinaryHeap<Neighbor> = BinaryHeap::with_capacity(ef + 1);
         for &ep in eps {
             visited.insert(ep.id);
             candidates.push(Reverse(ep));
-            results.push(ep);
-            if results.len() > ef {
-                results.pop();
+            if allowed(ep.id) {
+                results.push(ep);
+                if results.len() > ef {
+                    results.pop();
+                }
             }
         }
 
@@ -412,9 +446,11 @@ impl Hnsw {
                 if results.len() < ef || d < worst {
                     let nb = Neighbor::new(n, d);
                     candidates.push(Reverse(nb));
-                    results.push(nb);
-                    if results.len() > ef {
-                        results.pop();
+                    if allowed(n) {
+                        results.push(nb);
+                        if results.len() > ef {
+                            results.pop();
+                        }
                     }
                 }
             }
@@ -540,6 +576,32 @@ mod tests {
 
         let r = recall(&hnsw, &flat, &random_data(100, dim, 6), 10);
         assert!(r > 0.95, "recall {r}");
+    }
+
+    #[test]
+    fn filtered_search_only_returns_allowed_ids() {
+        let (n, dim, k) = (3000, 16, 10);
+        let data = random_data(n, dim, 7);
+        let mut hnsw = Hnsw::new(dim, Metric::L2, HnswParams::default());
+        hnsw.add_batch(&data);
+
+        let mut hits = 0;
+        let queries = random_data(50, dim, 8);
+        for q in queries.chunks_exact(dim) {
+            let res = hnsw.search_filtered(q, k, 64, |id| id % 2 == 0);
+            assert_eq!(res.len(), k);
+            assert!(res.iter().all(|n| n.id % 2 == 0));
+
+            let mut truth: Vec<Neighbor> = (0..n as u32)
+                .step_by(2)
+                .map(|id| Neighbor::new(id, Metric::L2.distance(q, hnsw.vector(id))))
+                .collect();
+            truth.sort_unstable();
+            let truth: Vec<u32> = truth[..k].iter().map(|n| n.id).collect();
+            hits += res.iter().filter(|n| truth.contains(&n.id)).count();
+        }
+        let recall = hits as f64 / (50 * k) as f64;
+        assert!(recall > 0.95, "recall {recall}");
     }
 
     #[test]
