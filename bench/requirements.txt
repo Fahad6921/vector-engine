@@ -1,2 +1,7 @@
 h5py>=3.10
 numpy>=1.26
+matplotlib>=3.8
+maturin>=1.7,<2
+hnswlib>=0.8
+# 1.11+ only ships macOS 14+ wheels
+faiss-cpu==1.10.0
