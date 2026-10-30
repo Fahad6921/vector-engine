@@ -20,8 +20,11 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use parking_lot::Mutex;
 use rayon::prelude::*;
 
+use crate::buf::Buf;
 use crate::distance::{normalize, Metric};
 use crate::neighbor::Neighbor;
+
+mod persist;
 
 #[derive(Debug, Clone, Copy)]
 pub struct HnswParams {
@@ -57,14 +60,14 @@ pub struct Hnsw {
     /// Level multiplier, 1 / ln(m).
     ml: f64,
 
-    data: Vec<f32>,
-    levels: Vec<u8>,
+    data: Buf<f32>,
+    levels: Buf<u8>,
     /// Layer 0 links, stride `m0 + 1`.
-    links0: Vec<AtomicU32>,
+    links0: Buf<AtomicU32>,
     /// Links for layers 1..=level of every node, concatenated. Node `i` owns
     /// `upper[upper_offsets[i]..upper_offsets[i + 1]]`, stride `m + 1` per layer.
-    upper: Vec<AtomicU32>,
-    upper_offsets: Vec<u64>,
+    upper: Buf<AtomicU32>,
+    upper_offsets: Buf<u64>,
     /// One lock per node, guarding its neighbour lists during builds.
     locks: Vec<Mutex<()>>,
 
@@ -83,11 +86,11 @@ impl Hnsw {
             params,
             m0: 2 * params.m,
             ml: 1.0 / (params.m as f64).ln(),
-            data: Vec::new(),
-            levels: Vec::new(),
-            links0: Vec::new(),
-            upper: Vec::new(),
-            upper_offsets: vec![0],
+            data: Buf::Owned(Vec::new()),
+            levels: Buf::Owned(Vec::new()),
+            links0: Buf::Owned(Vec::new()),
+            upper: Buf::Owned(Vec::new()),
+            upper_offsets: Buf::Owned(vec![0]),
             locks: Vec::new(),
             entry: None,
             rng: SplitMix64(params.seed),
@@ -144,21 +147,30 @@ impl Hnsw {
 
         // Allocate everything up front so the parallel phase only needs &self.
         // Levels are drawn sequentially, so they stay deterministic for a seed.
-        self.data.reserve(data.len());
+        let normalize_input = self.metric.needs_normalize();
+        let stride = self.params.m + 1;
+        let levels: Vec<u8> = (0..n).map(|_| self.random_level() as u8).collect();
+
+        let vectors = self.data.to_mut();
+        vectors.reserve(data.len());
         for v in data.chunks_exact(self.dim) {
-            let s = self.data.len();
-            self.data.extend_from_slice(v);
-            if self.metric.needs_normalize() {
-                normalize(&mut self.data[s..]);
+            let s = vectors.len();
+            vectors.extend_from_slice(v);
+            if normalize_input {
+                normalize(&mut vectors[s..]);
             }
-            let level = self.random_level();
-            self.levels.push(level as u8);
-            let end = self.upper.len() + level * (self.params.m + 1);
-            self.upper.resize_with(end, || AtomicU32::new(0));
-            self.upper_offsets.push(end as u64);
-            self.locks.push(Mutex::new(()));
         }
+        let upper = self.upper.to_mut();
+        let offsets = self.upper_offsets.to_mut();
+        for &level in &levels {
+            let end = upper.len() + level as usize * stride;
+            upper.resize_with(end, || AtomicU32::new(0));
+            offsets.push(end as u64);
+        }
+        self.levels.to_mut().extend_from_slice(&levels);
+        self.locks.resize_with(start + n, || Mutex::new(()));
         self.links0
+            .to_mut()
             .resize_with((start + n) * (self.m0 + 1), || AtomicU32::new(0));
 
         let mut first = start;

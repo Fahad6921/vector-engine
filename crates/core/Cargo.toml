@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+crc32fast = "1.5.3"
+memmap2 = "0.9.12"
 parking_lot = "0.13.0"
 rayon = "1.12.0"
 

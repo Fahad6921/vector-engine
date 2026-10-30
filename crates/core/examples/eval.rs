@@ -4,6 +4,9 @@
 //!     cargo run --release --example eval -- data/glove-100-angular --index flat
 //!     cargo run --release --example eval -- data/sift-128-euclidean --n 100000 --m 16 --efc 200 --ef 10,20,40,80
 //!
+//!     cargo run --release --example eval -- data/sift-128-euclidean --save sift.hnsw
+//!     cargo run --release --example eval -- data/sift-128-euclidean --load sift.hnsw
+//!
 //! `--n` uses the first N training vectors and computes exact ground truth for them.
 //! HNSW QPS is single-threaded, one query at a time (the ann-benchmarks convention).
 
@@ -23,6 +26,9 @@ struct Args {
     m: usize,
     efc: usize,
     ef: Vec<usize>,
+    save: Option<String>,
+    load: Option<String>,
+    verify: bool,
 }
 
 fn parse_args() -> Args {
@@ -34,6 +40,9 @@ fn parse_args() -> Args {
         m: 16,
         efc: 200,
         ef: vec![10, 20, 40, 80, 120, 200, 400, 800],
+        save: None,
+        load: None,
+        verify: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -45,6 +54,9 @@ fn parse_args() -> Args {
             "--m" => a.m = val().parse().expect("--m N"),
             "--efc" => a.efc = val().parse().expect("--efc N"),
             "--ef" => a.ef = val().split(',').map(|s| s.parse().expect("--ef a,b,c")).collect(),
+            "--save" => a.save = Some(val()),
+            "--load" => a.load = Some(val()),
+            "--verify" => a.verify = true,
             _ => a.dir = arg,
         }
     }
@@ -105,17 +117,39 @@ fn main() {
                 ef_construction: args.efc,
                 ..Default::default()
             };
-            let t = Instant::now();
-            let mut index = Hnsw::new(dim, ds.metric, params);
-            index.add_batch(&ds.train.data);
-            println!(
-                "hnsw M={} efC={}: built {} vectors in {:.1}s, {} levels",
-                args.m,
-                args.efc,
-                index.len(),
-                t.elapsed().as_secs_f64(),
-                index.max_level() + 1
-            );
+            let index = if let Some(path) = &args.load {
+                let t = Instant::now();
+                let index = Hnsw::load(path, args.verify).expect("failed to load index");
+                println!(
+                    "hnsw: mapped {} vectors from {path} in {:.3}s",
+                    index.len(),
+                    t.elapsed().as_secs_f64()
+                );
+                index
+            } else {
+                let t = Instant::now();
+                let mut index = Hnsw::new(dim, ds.metric, params);
+                index.add_batch(&ds.train.data);
+                println!(
+                    "hnsw M={} efC={}: built {} vectors in {:.1}s, {} levels",
+                    args.m,
+                    args.efc,
+                    index.len(),
+                    t.elapsed().as_secs_f64(),
+                    index.max_level() + 1
+                );
+                index
+            };
+            if let Some(path) = &args.save {
+                let t = Instant::now();
+                index.save(path).expect("failed to save index");
+                let size = std::fs::metadata(path).map_or(0, |m| m.len());
+                println!(
+                    "hnsw: saved to {path} ({:.0} MB) in {:.2}s",
+                    size as f64 / 1e6,
+                    t.elapsed().as_secs_f64()
+                );
+            }
 
             println!("{:>6} {:>10} {:>10}", "ef", "recall@10", "QPS");
             for &ef in &args.ef {

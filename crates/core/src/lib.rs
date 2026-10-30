@@ -1,5 +1,6 @@
 //! Core index structures for vector-engine.
 
+mod buf;
 pub mod dataset;
 pub mod distance;
 pub mod flat;
