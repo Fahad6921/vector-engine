@@ -23,6 +23,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --release
+      - run: cargo run --release -p vecengine-storage --example crash_test -- 200
 
   python:
     strategy:
