@@ -1045,6 +1045,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vecengine-storage"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "vecengine",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

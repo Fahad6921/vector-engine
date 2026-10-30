@@ -1,0 +1,11 @@
+[package]
+name = "vecengine-storage"
+description = "Durable collections for vector-engine: WAL, segments, deletes, compaction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crc32fast = "1.5.3"
+vecengine = { path = "../core" }
