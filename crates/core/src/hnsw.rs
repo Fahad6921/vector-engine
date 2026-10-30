@@ -194,6 +194,15 @@ impl Hnsw {
     fn insert(&self, id: u32, entry: &Mutex<Entry>) {
         let level = self.levels[id as usize] as usize;
 
+        // Hold our own lock for the whole insert. Once we link ourselves in on an
+        // upper layer, other inserts can reach us and descend into a lower layer
+        // from here before we've written that layer's list. Without the lock they
+        // would see an empty list (a dead end, so they get badly connected), and
+        // any link they add to us would be overwritten when we write our list.
+        // With it they wait until we're fully linked. This can't deadlock: we take
+        // it before anything links to us, so nobody can be waiting on it yet.
+        let _own = self.locks[id as usize].lock();
+
         // A node that will become the new top level holds the entry lock for its
         // whole insert, so no one else can see a half-linked entry point.
         let mut guard = Some(entry.lock());
@@ -214,11 +223,8 @@ impl Hnsw {
             let mut candidates = self.search_layer(q, &eps, self.params.ef_construction, layer, true);
             candidates.retain(|c| c.id != id);
             let selected = self.select_neighbors(&candidates, self.params.m);
-            {
-                let _lock = self.locks[id as usize].lock();
-                let ids: Vec<u32> = selected.iter().map(|n| n.id).collect();
-                self.write_links(id, layer, &ids);
-            }
+            let ids: Vec<u32> = selected.iter().map(|n| n.id).collect();
+            self.write_links(id, layer, &ids);
             for n in &selected {
                 self.connect(n.id, id, n.distance, layer);
             }
@@ -588,6 +594,20 @@ mod tests {
 
         let r = recall(&hnsw, &flat, &random_data(100, dim, 6), 10);
         assert!(r > 0.95, "recall {r}");
+    }
+
+    /// Regression test for a race in the parallel build: a node reached through
+    /// its upper-layer links before its lower-layer list was written became a dead
+    /// end, and ~1.6% of nodes ended up unreachable.
+    #[test]
+    fn parallel_build_leaves_every_node_reachable() {
+        let dim = 8;
+        let mut index = Hnsw::new(dim, Metric::L2, HnswParams::default());
+        index.add_batch(&random_data(3000, dim, 11));
+        let unreachable = (0..3000u32)
+            .filter(|&i| index.search(index.vector(i), 1, 100)[0].distance != 0.0)
+            .count();
+        assert_eq!(unreachable, 0);
     }
 
     #[test]
