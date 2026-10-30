@@ -22,6 +22,14 @@ impl Metric {
         }
     }
 
+    pub fn name(self) -> &'static str {
+        match self {
+            Metric::L2 => "l2",
+            Metric::InnerProduct => "ip",
+            Metric::Cosine => "cosine",
+        }
+    }
+
     #[inline]
     pub fn distance(self, a: &[f32], b: &[f32]) -> f32 {
         match self {
