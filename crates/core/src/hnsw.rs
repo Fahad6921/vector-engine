@@ -23,6 +23,7 @@ use rayon::prelude::*;
 use crate::buf::Buf;
 use crate::distance::{normalize, Metric};
 use crate::neighbor::Neighbor;
+use crate::quant::{QuantKind, Quantizer};
 
 mod persist;
 
@@ -74,6 +75,23 @@ pub struct Hnsw {
     entry: Option<Entry>,
     rng: SplitMix64,
     visited: Mutex<Vec<Visited>>,
+    quant: Option<Quantized>,
+}
+
+/// Compressed codes for every vector, used for approximate distances in search.
+struct Quantized {
+    kind: QuantKind,
+    quantizer: Quantizer,
+    codes: Vec<u8>,
+    size: usize,
+}
+
+impl Quantized {
+    #[inline]
+    fn code(&self, id: u32) -> &[u8] {
+        let i = id as usize * self.size;
+        &self.codes[i..i + self.size]
+    }
 }
 
 impl Hnsw {
@@ -95,6 +113,7 @@ impl Hnsw {
             entry: None,
             rng: SplitMix64(params.seed),
             visited: Mutex::new(Vec::new()),
+            quant: None,
         }
     }
 
@@ -172,6 +191,11 @@ impl Hnsw {
         self.links0
             .to_mut()
             .resize_with((start + n) * (self.m0 + 1), || AtomicU32::new(0));
+        if let Some(qz) = &mut self.quant {
+            for v in self.data[start * self.dim..].chunks_exact(self.dim) {
+                qz.quantizer.encode(v, &mut qz.codes);
+            }
+        }
 
         let mut first = start;
         let entry = *self.entry.get_or_insert_with(|| {
@@ -215,7 +239,7 @@ impl Hnsw {
         let mut buf = Vec::with_capacity(self.m0);
         let (mut ep, mut ep_dist) = (top.id, self.dist(q, top.id));
         for layer in (level + 1..=top.level).rev() {
-            (ep, ep_dist) = self.greedy_closest(q, ep, ep_dist, layer, true, &mut buf);
+            (ep, ep_dist) = self.greedy_closest(&|n| self.dist(q, n), ep, ep_dist, layer, true, &mut buf);
         }
 
         let mut eps = vec![Neighbor::new(ep, ep_dist)];
@@ -260,15 +284,67 @@ impl Hnsw {
             normalize(&mut q);
         }
 
-        let mut buf = Vec::with_capacity(self.m0);
-        let (mut ep, mut ep_dist) = (top.id, self.dist(&q, top.id));
-        for layer in (1..=top.level).rev() {
-            (ep, ep_dist) = self.greedy_closest(&q, ep, ep_dist, layer, false, &mut buf);
+        let Some(qz) = &self.quant else {
+            let mut res = self.walk(&|n| self.dist(&q, n), top, ef.max(k), allowed);
+            res.truncate(k);
+            return res;
+        };
+
+        // Walk the graph on approximate distances, then rescore the `ef`
+        // candidates with the full vectors.
+        let lut = qz.quantizer.prepare(&q, self.metric);
+        let approx = |n: u32| qz.quantizer.distance(&lut, qz.code(n), self.metric);
+        let mut res = self.walk(&approx, top, ef.max(k), allowed);
+        for n in &mut res {
+            n.distance = self.dist(&q, n.id);
         }
-        let eps = [Neighbor::new(ep, ep_dist)];
-        let mut res = self.search_layer_filtered(&q, &eps, ef.max(k), 0, false, allowed);
+        res.sort_unstable();
         res.truncate(k);
         res
+    }
+
+    /// Greedy descent through the upper layers, then a filtered beam search on layer 0.
+    fn walk<D: Fn(u32) -> f32, F: Fn(u32) -> bool>(
+        &self,
+        dist: &D,
+        top: Entry,
+        ef: usize,
+        allowed: F,
+    ) -> Vec<Neighbor> {
+        let mut buf = Vec::with_capacity(self.m0);
+        let (mut ep, mut ep_dist) = (top.id, dist(top.id));
+        for layer in (1..=top.level).rev() {
+            (ep, ep_dist) = self.greedy_closest(dist, ep, ep_dist, layer, false, &mut buf);
+        }
+        self.search_layer_filtered(dist, &[Neighbor::new(ep, ep_dist)], ef, 0, false, allowed)
+    }
+
+    /// Trains a quantizer on the stored vectors and encodes them all. Later
+    /// searches walk the graph on the compressed codes and rerank exactly; later
+    /// inserts are encoded with the same quantizer. Not saved by `save` yet.
+    pub fn quantize(&mut self, kind: QuantKind) {
+        let quantizer = Quantizer::train(kind, &self.data, self.dim);
+        let size = quantizer.code_size(self.dim);
+        let codes = self
+            .data
+            .par_chunks_exact(self.dim)
+            .flat_map_iter(|v| {
+                let mut c = Vec::with_capacity(size);
+                quantizer.encode(v, &mut c);
+                c
+            })
+            .collect();
+        self.quant = Some(Quantized {
+            kind,
+            quantizer,
+            codes,
+            size,
+        });
+    }
+
+    /// The active quantization and its code size in bytes per vector.
+    pub fn quantization(&self) -> Option<(QuantKind, usize)> {
+        self.quant.as_ref().map(|q| (q.kind, q.size))
     }
 
     /// Searches many queries in parallel. `queries` is row-major.
@@ -378,9 +454,9 @@ impl Hnsw {
     }
 
     /// Greedy walk on one layer: move to the closest neighbour until none is closer.
-    fn greedy_closest(
+    fn greedy_closest<D: Fn(u32) -> f32>(
         &self,
-        q: &[f32],
+        dist: &D,
         mut ep: u32,
         mut ep_dist: f32,
         layer: usize,
@@ -391,7 +467,7 @@ impl Hnsw {
             let mut moved = false;
             self.read_links(ep, layer, lock, buf);
             for &n in buf.iter() {
-                let d = self.dist(q, n);
+                let d = dist(n);
                 if d < ep_dist {
                     ep = n;
                     ep_dist = d;
@@ -413,7 +489,7 @@ impl Hnsw {
         layer: usize,
         lock: bool,
     ) -> Vec<Neighbor> {
-        self.search_layer_filtered(q, eps, ef, layer, lock, |_| true)
+        self.search_layer_filtered(&|n| self.dist(q, n), eps, ef, layer, lock, |_| true)
     }
 
     /// Beam search where only nodes passing `allowed` can enter the results.
@@ -422,9 +498,9 @@ impl Hnsw {
     /// skipping them would disconnect regions of allowed nodes. With very few
     /// allowed nodes the results rarely fill, so the search ends up walking most of
     /// the reachable graph; callers should fall back to brute force in that case.
-    fn search_layer_filtered<F: Fn(u32) -> bool>(
+    fn search_layer_filtered<D: Fn(u32) -> f32, F: Fn(u32) -> bool>(
         &self,
-        q: &[f32],
+        dist: &D,
         eps: &[Neighbor],
         ef: usize,
         layer: usize,
@@ -459,7 +535,7 @@ impl Hnsw {
                 if !visited.insert(n) {
                     continue;
                 }
-                let d = self.dist(q, n);
+                let d = dist(n);
                 let worst = results.peek().map_or(f32::INFINITY, |n| n.distance);
                 if results.len() < ef || d < worst {
                     let nb = Neighbor::new(n, d);
@@ -608,6 +684,28 @@ mod tests {
             .filter(|&i| index.search(index.vector(i), 1, 100)[0].distance != 0.0)
             .count();
         assert_eq!(unreachable, 0);
+    }
+
+    #[test]
+    fn quantized_search_keeps_recall_after_rerank() {
+        let (n, dim) = (3000, 16);
+        let data = random_data(n, dim, 12);
+        let queries = random_data(100, dim, 13);
+        let mut flat = FlatIndex::new(dim, Metric::L2);
+        flat.add_batch(&data);
+
+        for kind in [QuantKind::Sq8, QuantKind::Pq { m: 8 }, QuantKind::Binary] {
+            let mut index = Hnsw::new(dim, Metric::L2, HnswParams::default());
+            index.add_batch(&data[..2000 * dim]);
+            index.quantize(kind);
+            index.add_batch(&data[2000 * dim..]); // encoded with the trained quantizer
+            let r = recall(&index, &flat, &queries, 10);
+            let floor = if kind == QuantKind::Binary { 0.6 } else { 0.85 };
+            assert!(r > floor, "{kind:?}: recall {r}");
+            // Reranked distances are exact.
+            let res = index.search(&data[..dim], 1, 64);
+            assert_eq!((res[0].id, res[0].distance), (0, 0.0), "{kind:?}");
+        }
     }
 
     #[test]

@@ -249,6 +249,7 @@ impl Hnsw {
             entry,
             rng: SplitMix64(rng_state),
             visited: Mutex::new(Vec::new()),
+            quant: None,
         })
     }
 
