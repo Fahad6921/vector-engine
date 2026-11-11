@@ -6,6 +6,7 @@
 //!
 //!     cargo run --release --example eval -- data/sift-128-euclidean --save sift.hnsw
 //!     cargo run --release --example eval -- data/sift-128-euclidean --load sift.hnsw
+//!     cargo run --release --example eval -- data/sift-128-euclidean --load sift.hnsw --quant none,sq8,pq32,binary
 //!
 //! `--n` uses the first N training vectors and computes exact ground truth for them.
 //! HNSW QPS is single-threaded, one query at a time (the ann-benchmarks convention).
@@ -14,7 +15,7 @@ use std::time::Instant;
 
 use vecengine::dataset::{recall_at_k, Dataset};
 use vecengine::io::Vectors;
-use vecengine::{FlatIndex, Hnsw, HnswParams};
+use vecengine::{FlatIndex, Hnsw, HnswParams, QuantKind};
 
 const K: usize = 10;
 
@@ -29,6 +30,7 @@ struct Args {
     save: Option<String>,
     load: Option<String>,
     verify: bool,
+    quant: Vec<String>,
 }
 
 fn parse_args() -> Args {
@@ -43,6 +45,7 @@ fn parse_args() -> Args {
         save: None,
         load: None,
         verify: false,
+        quant: vec!["none".into()],
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -57,6 +60,7 @@ fn parse_args() -> Args {
             "--save" => a.save = Some(val()),
             "--load" => a.load = Some(val()),
             "--verify" => a.verify = true,
+            "--quant" => a.quant = val().split(',').map(String::from).collect(),
             _ => a.dir = arg,
         }
     }
@@ -140,6 +144,10 @@ fn main() {
                 );
                 index
             };
+            let mut index = index;
+            // The index has its own copy of the vectors; free the dataset's so an
+            // 8 GB machine doesn't swap during the timed searches.
+            ds.train.data = Vec::new();
             if let Some(path) = &args.save {
                 let t = Instant::now();
                 index.save(path).expect("failed to save index");
@@ -151,19 +159,33 @@ fn main() {
                 );
             }
 
-            println!("{:>6} {:>10} {:>10}", "ef", "recall@10", "QPS");
-            for &ef in &args.ef {
-                let t = Instant::now();
-                let results: Vec<_> = queries
-                    .chunks_exact(dim)
-                    .map(|q| index.search(q, K, ef))
-                    .collect();
-                let secs = t.elapsed().as_secs_f64();
-                println!(
-                    "{ef:>6} {:>10.4} {:>10.0}",
-                    recall_at_k(&results, &ds.neighbors, K),
-                    nq as f64 / secs
-                );
+            for name in &args.quant {
+                if name != "none" {
+                    let kind = QuantKind::from_name(name).expect("--quant takes none, sq8, pqN or binary");
+                    let t = Instant::now();
+                    index.quantize(kind);
+                    let (_, bytes) = index.quantization().unwrap();
+                    println!(
+                        "{name}: trained and encoded in {:.1}s, {bytes} bytes/vector",
+                        t.elapsed().as_secs_f64()
+                    );
+                } else {
+                    println!("none: {} bytes/vector", dim * 4);
+                }
+                println!("{:>6} {:>10} {:>10}", "ef", "recall@10", "QPS");
+                for &ef in &args.ef {
+                    let t = Instant::now();
+                    let results: Vec<_> = queries
+                        .chunks_exact(dim)
+                        .map(|q| index.search(q, K, ef))
+                        .collect();
+                    let secs = t.elapsed().as_secs_f64();
+                    println!(
+                        "{ef:>6} {:>10.4} {:>10.0}",
+                        recall_at_k(&results, &ds.neighbors, K),
+                        nq as f64 / secs
+                    );
+                }
             }
         }
         other => panic!("unknown index {other:?}, expected flat or hnsw"),
