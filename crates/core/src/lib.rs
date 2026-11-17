@@ -8,6 +8,7 @@ pub mod hnsw;
 pub mod io;
 pub mod neighbor;
 pub mod quant;
+pub mod text;
 
 pub use distance::Metric;
 pub use flat::FlatIndex;
