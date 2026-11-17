@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use vecengine::{HnswParams, Metric};
 
+use crate::filter::{validate_payload, Filter, PayloadIndex};
 use crate::segment::{parse_segment_file, write_atomic, Segment};
 use crate::wal::{Record, Wal};
 
@@ -58,6 +59,23 @@ impl Config {
             ..Default::default()
         }
     }
+}
+
+/// How a filtered search runs within each segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FilterStrategy {
+    /// Exact scan of the matching points when few match, graph walk otherwise.
+    #[default]
+    Auto,
+    /// Always walk the graph, skipping non-matching points.
+    Graph,
+    /// Always score every matching point exactly.
+    BruteForce,
+}
+
+/// Matching-point count at or below which `Auto` scans exactly.
+fn brute_force_limit(segment_len: usize) -> usize {
+    segment_len / 10
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -172,7 +190,8 @@ impl Collection {
     /// Applies a batch of writes with a single WAL append (one fsync).
     pub fn write(&mut self, records: Vec<Record>) -> io::Result<()> {
         for r in &records {
-            if let Record::Upsert { vector, .. } = r {
+            if let Record::Upsert { vector, payload, .. } = r {
+                validate_payload(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
                 if vector.len() != self.config.dim {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
@@ -206,6 +225,7 @@ impl Collection {
                     let mem = &mut self.parts[mem_index];
                     let internal = mem.ids.len() as u32;
                     mem.ids.push(id);
+                    mem.payload_index.add(internal, &payload);
                     mem.payloads.push(payload);
                     vectors.extend_from_slice(&vector);
                     self.locations.insert(id, (mem_index as u32, internal));
@@ -235,12 +255,49 @@ impl Collection {
 
     /// The `k` nearest live points across all segments, closest first.
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<Hit> {
+        self.search_filtered(query, k, ef, None, FilterStrategy::Auto)
+    }
+
+    /// Like `search`, restricted to points whose payload matches `filter`.
+    ///
+    /// Per segment, when few points match, the graph walk would spend most of its
+    /// time on rejected nodes, so `Auto` scores the matching points exactly
+    /// instead. The cut-off was picked from `examples/filter_bench.rs`.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: Option<&Filter>,
+        strategy: FilterStrategy,
+    ) -> Vec<Hit> {
         let mut hits: Vec<Hit> = Vec::new();
         for part in &self.parts {
+            let n = part.ids.len();
             if part.live_count() == 0 {
                 continue;
             }
-            let res = part.index.search_filtered(query, k, ef, |i| part.is_live(i));
+            let res = match filter {
+                None => part.index.search_filtered(query, k, ef, |i| part.is_live(i)),
+                Some(f) => {
+                    let allowed = part.payload_index.eval(f, n).and_not(&part.deleted);
+                    let matching = allowed.count();
+                    if matching == 0 {
+                        continue;
+                    }
+                    let brute = match strategy {
+                        FilterStrategy::Auto => matching <= brute_force_limit(n),
+                        FilterStrategy::Graph => false,
+                        FilterStrategy::BruteForce => true,
+                    };
+                    if brute {
+                        part.index.search_subset(query, k, allowed.iter())
+                    } else {
+                        part.index
+                            .search_filtered(query, k, ef, |i| allowed.get(i as usize))
+                    }
+                }
+            };
             hits.extend(res.iter().map(|n| Hit {
                 id: part.ids[n.id as usize],
                 distance: n.distance,
@@ -305,6 +362,7 @@ impl Collection {
             }
         }
         merged.index.add_batch(&vectors);
+        merged.payload_index = PayloadIndex::build(merged.payloads.iter().map(Vec::as_slice));
 
         let mut parts = Vec::new();
         if !merged.ids.is_empty() {
@@ -440,20 +498,20 @@ mod tests {
         let dir = temp_dir("basic");
         let mut c = Collection::open(&dir, config(1000)).unwrap();
         for id in 0..100 {
-            c.upsert(id, &vec_for(id, 8), format!("p{id}").as_bytes())
+            c.upsert(id, &vec_for(id, 8), format!(r#"{{"n":{id}}}"#).as_bytes())
                 .unwrap();
         }
         assert_eq!(c.len(), 100);
         assert_eq!(c.search(&vec_for(42, 8), 1, 50)[0].id, 42);
-        assert_eq!(c.get(42).unwrap().1, b"p42");
+        assert_eq!(c.get(42).unwrap().1, br#"{"n":42}"#);
 
         c.delete(42).unwrap();
         assert!(c.get(42).is_none());
         assert_ne!(c.search(&vec_for(42, 8), 1, 50)[0].id, 42);
 
-        c.upsert(7, &vec_for(500, 8), b"new").unwrap();
+        c.upsert(7, &vec_for(500, 8), br#"{"v":"new"}"#).unwrap();
         assert_eq!(c.len(), 99);
-        assert_eq!(c.get(7).unwrap().1, b"new");
+        assert_eq!(c.get(7).unwrap().1, br#"{"v":"new"}"#);
         assert_eq!(c.search(&vec_for(500, 8), 1, 50)[0].id, 7);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -464,17 +522,18 @@ mod tests {
         {
             let mut c = Collection::open(&dir, config(30)).unwrap();
             for id in 0..100 {
-                c.upsert(id, &vec_for(id, 8), &id.to_le_bytes()).unwrap();
+                c.upsert(id, &vec_for(id, 8), format!(r#"{{"n":{id}}}"#).as_bytes())
+                    .unwrap();
             }
             c.delete(3).unwrap(); // in a flushed segment
             c.delete(95).unwrap(); // in the memtable
-            c.upsert(10, &vec_for(1000, 8), b"moved").unwrap();
+            c.upsert(10, &vec_for(1000, 8), br#"{"v":"moved"}"#).unwrap();
             assert!(c.stats().segments >= 3);
         }
         let c = Collection::open(&dir, config(30)).unwrap();
         assert_eq!(c.len(), 98);
         assert!(c.get(3).is_none() && c.get(95).is_none());
-        assert_eq!(c.get(10).unwrap().1, b"moved");
+        assert_eq!(c.get(10).unwrap().1, br#"{"v":"moved"}"#);
         assert_eq!(c.get(50).unwrap().0, vec_for(50, 8).as_slice());
         assert_eq!(c.search(&vec_for(1000, 8), 1, 50)[0].id, 10);
         fs::remove_dir_all(dir).unwrap();
@@ -518,6 +577,57 @@ mod tests {
         assert!(c.search(&vec_for(1, 8), 5, 50).is_empty());
         c.upsert(1, &vec_for(1, 8), b"").unwrap();
         assert_eq!(c.search(&vec_for(1, 8), 5, 50)[0].id, 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn filtered_search_across_segments() {
+        let dir = temp_dir("filtered");
+        let mut c = Collection::open(&dir, config(150)).unwrap();
+        for id in 0..400u64 {
+            let payload = format!(
+                r#"{{"parity": "{}", "n": {id}}}"#,
+                if id % 2 == 0 { "even" } else { "odd" }
+            );
+            c.upsert(id, &vec_for(id, 8), payload.as_bytes()).unwrap();
+        }
+        assert!(c.stats().segments >= 2 && c.stats().memtable > 0);
+        c.delete(10).unwrap();
+
+        let odd = Filter::parse(r#"{"field": "parity", "eq": "odd"}"#).unwrap();
+        let rare = Filter::parse(r#"{"field": "n", "range": {"gte": 10, "lte": 12}}"#).unwrap();
+        for strategy in [
+            FilterStrategy::Auto,
+            FilterStrategy::Graph,
+            FilterStrategy::BruteForce,
+        ] {
+            let hits = c.search_filtered(&vec_for(5, 8), 10, 100, Some(&odd), strategy);
+            assert_eq!(hits.len(), 10);
+            assert!(hits.iter().all(|h| h.id % 2 == 1), "{strategy:?}");
+            assert_eq!(hits[0].id, 5);
+
+            // 10 was deleted, so only 11 and 12 match.
+            let hits = c.search_filtered(&vec_for(10, 8), 10, 100, Some(&rare), strategy);
+            let mut ids: Vec<u64> = hits.iter().map(|h| h.id).collect();
+            ids.sort();
+            assert_eq!(ids, vec![11, 12], "{strategy:?}");
+        }
+
+        // Filters still work after reopening (index rebuilt from segment payloads).
+        drop(c);
+        let c = Collection::open(&dir, config(150)).unwrap();
+        let hits = c.search_filtered(&vec_for(10, 8), 10, 100, Some(&rare), FilterStrategy::Auto);
+        assert_eq!(hits.len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_non_object_payloads() {
+        let dir = temp_dir("payloads");
+        let mut c = Collection::open(&dir, config(10)).unwrap();
+        assert!(c.upsert(1, &vec_for(1, 8), b"[1, 2]").is_err());
+        assert!(c.upsert(1, &vec_for(1, 8), b"not json").is_err());
+        assert!(c.upsert(1, &vec_for(1, 8), b"").is_ok());
         fs::remove_dir_all(dir).unwrap();
     }
 

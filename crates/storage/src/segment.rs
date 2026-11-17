@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 
 use vecengine::{Hnsw, HnswParams, Metric};
 
+use crate::bitset::Bitset;
+use crate::filter::PayloadIndex;
+
 pub(crate) struct Segment {
     /// None for the memtable.
     pub id: Option<u64>,
@@ -21,6 +24,7 @@ pub(crate) struct Segment {
     pub ids: Vec<u64>,
     pub payloads: Vec<Vec<u8>>,
     pub deleted: Bitset,
+    pub payload_index: PayloadIndex,
     /// Deletions since the .del file was last written.
     pub deleted_dirty: bool,
 }
@@ -33,6 +37,7 @@ impl Segment {
             ids: Vec::new(),
             payloads: Vec::new(),
             deleted: Bitset::default(),
+            payload_index: PayloadIndex::default(),
             deleted_dirty: false,
         }
     }
@@ -60,12 +65,14 @@ impl Segment {
                 ids.len()
             )));
         }
+        let payload_index = PayloadIndex::build(payloads.iter().map(Vec::as_slice));
         Ok(Self {
             id: Some(id),
             index,
             ids,
             payloads,
             deleted,
+            payload_index,
             deleted_dirty: false,
         })
     }
@@ -79,6 +86,7 @@ impl Segment {
         )?;
         self.id = Some(id);
         self.deleted_dirty = self.deleted.count() > 0;
+        self.payload_index.finish();
         Ok(())
     }
 
@@ -105,51 +113,6 @@ pub(crate) fn path(dir: &Path, id: u64, ext: &str) -> PathBuf {
 /// The segment number in a file name like `seg-000012.hnsw`.
 pub(crate) fn parse_segment_file(name: &str) -> Option<u64> {
     name.strip_prefix("seg-")?.split('.').next()?.parse().ok()
-}
-
-#[derive(Default, Clone)]
-pub(crate) struct Bitset {
-    words: Vec<u64>,
-    count: usize,
-}
-
-impl Bitset {
-    pub fn get(&self, i: usize) -> bool {
-        self.words.get(i / 64).is_some_and(|w| w & (1 << (i % 64)) != 0)
-    }
-
-    pub fn set(&mut self, i: usize) {
-        if self.words.len() <= i / 64 {
-            self.words.resize(i / 64 + 1, 0);
-        }
-        let bit = 1 << (i % 64);
-        if self.words[i / 64] & bit == 0 {
-            self.words[i / 64] |= bit;
-            self.count += 1;
-        }
-    }
-
-    pub fn count(&self) -> usize {
-        self.count
-    }
-
-    fn encode(&self) -> Vec<u8> {
-        self.words.iter().flat_map(|w| w.to_le_bytes()).collect()
-    }
-
-    fn decode(bytes: &[u8]) -> io::Result<Self> {
-        if !bytes.len().is_multiple_of(8) {
-            return Err(invalid("deletion bitmap has a partial word"));
-        }
-        let words: Vec<u64> = bytes
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|b| u64::from_le_bytes(*b))
-            .collect();
-        let count = words.iter().map(|w| w.count_ones() as usize).sum();
-        Ok(Self { words, count })
-    }
 }
 
 fn encode_meta(ids: &[u64], payloads: &[Vec<u8>]) -> Vec<u8> {
@@ -232,19 +195,6 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bitset_roundtrip() {
-        let mut b = Bitset::default();
-        for i in [0, 5, 63, 64, 200, 5] {
-            b.set(i);
-        }
-        assert_eq!(b.count(), 5);
-        assert!(b.get(64) && !b.get(65) && !b.get(10_000));
-        let d = Bitset::decode(&b.encode()).unwrap();
-        assert_eq!(d.count(), 5);
-        assert!(d.get(200));
-    }
 
     #[test]
     fn meta_roundtrip_and_rejects_garbage() {

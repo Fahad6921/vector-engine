@@ -22,7 +22,7 @@ use rayon::prelude::*;
 
 use crate::buf::Buf;
 use crate::distance::{normalize, Metric};
-use crate::neighbor::Neighbor;
+use crate::neighbor::{Neighbor, TopK};
 use crate::quant::{QuantKind, Quantizer};
 
 mod persist;
@@ -345,6 +345,26 @@ impl Hnsw {
     /// The active quantization and its code size in bytes per vector.
     pub fn quantization(&self) -> Option<(QuantKind, usize)> {
         self.quant.as_ref().map(|q| (q.kind, q.size))
+    }
+
+    /// Exact search over just the given ids. Used for very selective filters,
+    /// where the graph walk would spend most of its time on rejected nodes.
+    pub fn search_subset(
+        &self,
+        query: &[f32],
+        k: usize,
+        ids: impl IntoIterator<Item = u32>,
+    ) -> Vec<Neighbor> {
+        assert_eq!(query.len(), self.dim, "query has wrong dimension");
+        let mut q = query.to_vec();
+        if self.metric.needs_normalize() {
+            normalize(&mut q);
+        }
+        let mut top = TopK::new(k);
+        for id in ids {
+            top.push(Neighbor::new(id, self.dist(&q, id)));
+        }
+        top.into_sorted_vec()
     }
 
     /// Searches many queries in parallel. `queries` is row-major.

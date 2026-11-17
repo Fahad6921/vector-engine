@@ -61,7 +61,7 @@ fn op(i: u64) -> Op {
             Record::Upsert {
                 id,
                 vector: vector(i * 8 + salt),
-                payload: (i * 8 + salt).to_le_bytes().to_vec(),
+                payload: format!(r#"{{"op":{}}}"#, i * 8 + salt).into_bytes(),
             }
         } else {
             Record::Delete { id }
