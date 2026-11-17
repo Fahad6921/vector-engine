@@ -39,3 +39,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: pip install ./crates/py pytest
       - run: pytest -q crates/py/tests
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t vecengine .
+      - run: docker run -d --name ve -p 8080:8080 vecengine
+      - name: smoke test
+        run: |
+          for i in $(seq 30); do curl -sf localhost:8080/health && break; sleep 1; done
+          curl -sf -X PUT localhost:8080/collections/demo -H 'content-type: application/json' \
+            -d '{"dim": 3, "metric": "l2"}'
+          curl -sf -X PUT localhost:8080/collections/demo/points -H 'content-type: application/json' \
+            -d '{"points": [{"id": 1, "vector": [0, 0, 0]}, {"id": 2, "vector": [1, 1, 1]}]}'
+          curl -sf -X POST localhost:8080/collections/demo/search -H 'content-type: application/json' \
+            -d '{"vector": [0.9, 0.9, 0.9], "k": 1}' | tee /dev/stderr | grep -q '"id":2'
+      - if: failure()
+        run: docker logs ve
