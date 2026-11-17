@@ -7,6 +7,8 @@ timed RUNS times and the best run is kept, to cut scheduler noise.
 Usage:
     python bench/run.py sift-128-euclidean
     python bench/run.py glove-100-angular --libs vecengine,hnswlib --queries 2000
+
+Results for libraries not run are kept from the existing results file.
 """
 
 import argparse
@@ -161,11 +163,19 @@ def main():
         "machine": f"{platform.system()} {platform.machine()} {platform.processor()}",
         "results": {},
     }
+    # Keep results for libraries not run this time, so they can be run one per
+    # process (three 1M-vector builds in one process can exhaust an 8 GB machine).
+    dest = ROOT / "bench" / "results" / f"{args.dataset}.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        old = json.loads(dest.read_text())
+        same = all(old.get(k) == out[k] for k in ("m", "ef_construction", "queries"))
+        if same:
+            out["results"] = old["results"]
+
     for name in args.libs.split(","):
         out["results"][name] = run(LIBS[name], train, test, neighbors, metric, args.m, args.efc)
 
-    dest = ROOT / "bench" / "results" / f"{args.dataset}.json"
-    dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(out, indent=2))
     print(f"wrote {dest}")
 
