@@ -162,6 +162,12 @@ impl Collection {
         Ok(c)
     }
 
+    /// The config an existing collection was created with, read from its manifest.
+    /// Runtime-only settings (`flush_threshold`, `sync`) come back as defaults.
+    pub fn stored_config(dir: impl AsRef<Path>) -> io::Result<Config> {
+        Ok(parse_manifest(&dir.as_ref().join("manifest.json"))?.config)
+    }
+
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -493,7 +499,13 @@ fn write_manifest(path: &Path, config: &Config, segments: &[u64], next_segment: 
     write_atomic(path, serde_json::to_string_pretty(&json).unwrap().as_bytes())
 }
 
-fn read_manifest(path: &Path, config: &Config) -> io::Result<(Vec<u64>, u64)> {
+struct Manifest {
+    config: Config,
+    segments: Vec<u64>,
+    next_segment: u64,
+}
+
+fn parse_manifest(path: &Path) -> io::Result<Manifest> {
     let bad = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, format!("manifest: {msg}"));
     let json: serde_json::Value =
         serde_json::from_slice(&fs::read(path)?).map_err(|e| bad(&e.to_string()))?;
@@ -503,34 +515,43 @@ fn read_manifest(path: &Path, config: &Config) -> io::Result<(Vec<u64>, u64)> {
             .as_u64()
             .ok_or_else(|| bad(&format!("{k} is not a number")))
     };
-
-    let found = (
-        num("dim")? as usize,
-        field("metric")?.as_str().and_then(Metric::from_name),
-        num("m")? as usize,
-        num("ef_construction")? as usize,
-        json.get("text_field").and_then(|v| v.as_str()).map(String::from),
-    );
-    let wanted = (
-        config.dim,
-        Some(config.metric),
-        config.m,
-        config.ef_construction,
-        config.text_field.clone(),
-    );
-    if found != wanted {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("collection was created with (dim, metric, m, ef_construction, text_field) = {found:?}, opened with {wanted:?}"),
-        ));
-    }
+    let metric = field("metric")?
+        .as_str()
+        .and_then(Metric::from_name)
+        .ok_or_else(|| bad("unknown metric"))?;
+    let config = Config {
+        m: num("m")? as usize,
+        ef_construction: num("ef_construction")? as usize,
+        text_field: json.get("text_field").and_then(|v| v.as_str()).map(String::from),
+        ..Config::new(num("dim")? as usize, metric)
+    };
     let segments = field("segments")?
         .as_array()
         .ok_or_else(|| bad("segments is not a list"))?
         .iter()
         .map(|v| v.as_u64().ok_or_else(|| bad("bad segment id")))
         .collect::<io::Result<Vec<_>>>()?;
-    Ok((segments, num("next_segment")?))
+    Ok(Manifest {
+        config,
+        segments,
+        next_segment: num("next_segment")?,
+    })
+}
+
+fn read_manifest(path: &Path, config: &Config) -> io::Result<(Vec<u64>, u64)> {
+    let m = parse_manifest(path)?;
+    let key = |c: &Config| (c.dim, c.metric, c.m, c.ef_construction, c.text_field.clone());
+    if key(&m.config) != key(config) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "collection was created with (dim, metric, m, ef_construction, text_field) = {:?}, opened with {:?}",
+                key(&m.config),
+                key(config)
+            ),
+        ));
+    }
+    Ok((m.segments, m.next_segment))
 }
 
 /// Deletes segment files the manifest doesn't reference (left by a crash during
@@ -749,6 +770,30 @@ mod tests {
             Collection::open(&dir, config(3)).is_err(),
             "text_field must match"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stored_config_roundtrips() {
+        let dir = temp_dir("stored");
+        let cfg = Config {
+            m: 8,
+            text_field: Some("body".into()),
+            ..Config::new(5, Metric::Cosine)
+        };
+        Collection::open(&dir, cfg.clone()).unwrap();
+        let stored = Collection::stored_config(&dir).unwrap();
+        assert_eq!(
+            (
+                stored.dim,
+                stored.metric,
+                stored.m,
+                stored.ef_construction,
+                stored.text_field.clone()
+            ),
+            (5, Metric::Cosine, 8, 200, Some("body".into()))
+        );
+        Collection::open(&dir, stored).unwrap();
         fs::remove_dir_all(dir).unwrap();
     }
 
