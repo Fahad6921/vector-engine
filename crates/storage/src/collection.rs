@@ -22,10 +22,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use vecengine::text::{rrf, tokenize, CorpusStats};
 use vecengine::{HnswParams, Metric};
 
 use crate::filter::{validate_payload, Filter, PayloadIndex};
-use crate::segment::{parse_segment_file, write_atomic, Segment};
+use crate::segment::{build_text_index, parse_segment_file, text_of, write_atomic, Segment};
 use crate::wal::{Record, Wal};
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,8 @@ pub struct Config {
     pub flush_threshold: usize,
     /// fsync the WAL on every write. Off trades durability on power loss for speed.
     pub sync: bool,
+    /// Payload field to index for BM25 keyword and hybrid search.
+    pub text_field: Option<String>,
 }
 
 impl Config {
@@ -49,6 +52,7 @@ impl Config {
             ef_construction: 200,
             flush_threshold: 100_000,
             sync: true,
+            text_field: None,
         }
     }
 
@@ -72,6 +76,11 @@ pub enum FilterStrategy {
     /// Always score every matching point exactly.
     BruteForce,
 }
+
+/// Candidates taken from each of vector and keyword search before fusion.
+const HYBRID_DEPTH: usize = 100;
+/// The usual RRF constant (Cormack et al., 2009).
+const RRF_C: f32 = 60.0;
 
 /// Matching-point count at or below which `Auto` scans exactly.
 fn brute_force_limit(segment_len: usize) -> usize {
@@ -127,7 +136,7 @@ impl Collection {
         remove_orphans(&dir, &segment_ids)?;
         let mut parts = segment_ids
             .iter()
-            .map(|&id| Segment::load(&dir, id))
+            .map(|&id| Segment::load(&dir, id, config.text_field.as_deref()))
             .collect::<io::Result<Vec<_>>>()?;
         parts.push(Segment::empty(config.dim, config.metric, config.params()));
 
@@ -226,6 +235,14 @@ impl Collection {
                     let internal = mem.ids.len() as u32;
                     mem.ids.push(id);
                     mem.payload_index.add(internal, &payload);
+                    if let Some(t) = self
+                        .config
+                        .text_field
+                        .as_deref()
+                        .and_then(|f| text_of(&payload, f))
+                    {
+                        mem.text.add(internal, &t);
+                    }
                     mem.payloads.push(payload);
                     vectors.extend_from_slice(&vector);
                     self.locations.insert(id, (mem_index as u32, internal));
@@ -308,6 +325,62 @@ impl Collection {
         hits
     }
 
+    /// BM25 keyword search over the configured text field. Hits carry the negated
+    /// BM25 score as `distance`, so lower is still better. Empty if the collection
+    /// has no text field.
+    pub fn search_text(&self, query: &str, k: usize, filter: Option<&Filter>) -> Vec<Hit> {
+        let terms = tokenize(query);
+        let mut stats = CorpusStats::default();
+        for part in &self.parts {
+            stats.merge(&part.text.stats(&terms));
+        }
+        let mut hits = Vec::new();
+        for part in &self.parts {
+            if part.live_count() == 0 {
+                continue;
+            }
+            let allowed = filter.map(|f| part.payload_index.eval(f, part.ids.len()));
+            let res = part.text.search(&terms, k, &stats, |d| {
+                part.is_live(d) && allowed.as_ref().is_none_or(|a| a.get(d as usize))
+            });
+            hits.extend(res.iter().map(|n| Hit {
+                id: part.ids[n.id as usize],
+                distance: n.distance,
+            }));
+        }
+        hits.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
+        hits.truncate(k);
+        hits
+    }
+
+    /// Vector and keyword search fused with reciprocal rank fusion over the top
+    /// `HYBRID_DEPTH` of each. `distance` is the negated fused score.
+    pub fn search_hybrid(
+        &self,
+        vector: &[f32],
+        text: &str,
+        k: usize,
+        ef: usize,
+        filter: Option<&Filter>,
+    ) -> Vec<Hit> {
+        let depth = HYBRID_DEPTH.max(k);
+        let by_vector: Vec<u64> = self
+            .search_filtered(vector, depth, ef.max(depth), filter, FilterStrategy::Auto)
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        let by_text: Vec<u64> = self
+            .search_text(text, depth, filter)
+            .iter()
+            .map(|h| h.id)
+            .collect();
+        rrf(&[by_vector, by_text], RRF_C)
+            .into_iter()
+            .take(k)
+            .map(|(id, score)| Hit { id, distance: -score })
+            .collect()
+    }
+
     /// Writes the memtable out as a segment, persists deletion bitmaps and empties
     /// the WAL.
     pub fn flush(&mut self) -> io::Result<()> {
@@ -363,6 +436,7 @@ impl Collection {
         }
         merged.index.add_batch(&vectors);
         merged.payload_index = PayloadIndex::build(merged.payloads.iter().map(Vec::as_slice));
+        merged.text = build_text_index(&merged.payloads, self.config.text_field.as_deref());
 
         let mut parts = Vec::new();
         if !merged.ids.is_empty() {
@@ -412,6 +486,7 @@ fn write_manifest(path: &Path, config: &Config, segments: &[u64], next_segment: 
         "metric": config.metric.name(),
         "m": config.m,
         "ef_construction": config.ef_construction,
+        "text_field": config.text_field,
         "segments": segments,
         "next_segment": next_segment,
     });
@@ -434,12 +509,19 @@ fn read_manifest(path: &Path, config: &Config) -> io::Result<(Vec<u64>, u64)> {
         field("metric")?.as_str().and_then(Metric::from_name),
         num("m")? as usize,
         num("ef_construction")? as usize,
+        json.get("text_field").and_then(|v| v.as_str()).map(String::from),
     );
-    let wanted = (config.dim, Some(config.metric), config.m, config.ef_construction);
+    let wanted = (
+        config.dim,
+        Some(config.metric),
+        config.m,
+        config.ef_construction,
+        config.text_field.clone(),
+    );
     if found != wanted {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("collection was created with (dim, metric, m, ef_construction) = {found:?}, opened with {wanted:?}"),
+            format!("collection was created with (dim, metric, m, ef_construction, text_field) = {found:?}, opened with {wanted:?}"),
         ));
     }
     let segments = field("segments")?
@@ -618,6 +700,55 @@ mod tests {
         let c = Collection::open(&dir, config(150)).unwrap();
         let hits = c.search_filtered(&vec_for(10, 8), 10, 100, Some(&rare), FilterStrategy::Auto);
         assert_eq!(hits.len(), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn text_and_hybrid_search() {
+        let dir = temp_dir("text");
+        let cfg = || Config {
+            text_field: Some("body".into()),
+            ..config(3)
+        };
+        let docs = [
+            "rust vector database",
+            "python data science",
+            "rust compiler internals",
+            "baking sourdough bread",
+            "vector search with hnsw graphs",
+        ];
+        let mut c = Collection::open(&dir, cfg()).unwrap();
+        for (i, d) in docs.iter().enumerate() {
+            let payload = format!(
+                r#"{{"body": "{d}", "lang": "{}"}}"#,
+                if i % 2 == 0 { "en" } else { "fr" }
+            );
+            c.upsert(i as u64, &vec_for(i as u64, 8), payload.as_bytes())
+                .unwrap();
+        }
+        assert!(c.stats().segments >= 1 && c.stats().memtable > 0);
+
+        let ids = |hits: Vec<Hit>| hits.iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(ids(c.search_text("rust", 10, None)), vec![0, 2]);
+        assert_eq!(ids(c.search_text("vector", 10, None)).len(), 2);
+        assert!(c.search_text("quantum", 10, None).is_empty());
+        let fr = Filter::parse(r#"{"field": "lang", "eq": "fr"}"#).unwrap();
+        assert_eq!(ids(c.search_text("rust python", 10, Some(&fr))), vec![1]);
+
+        // Hybrid: doc 4 is the vector match, doc 0 the keyword match; both rank.
+        let hybrid = ids(c.search_hybrid(&vec_for(4, 8), "rust database", 3, 50, None));
+        assert!(hybrid.contains(&4) && hybrid.contains(&0), "{hybrid:?}");
+
+        c.delete(0).unwrap();
+        assert_eq!(ids(c.search_text("rust", 10, None)), vec![2]);
+        drop(c);
+
+        let c = Collection::open(&dir, cfg()).unwrap();
+        assert_eq!(ids(c.search_text("rust", 10, None)), vec![2]);
+        assert!(
+            Collection::open(&dir, config(3)).is_err(),
+            "text_field must match"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

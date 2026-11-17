@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use vecengine::text::Bm25Index;
 use vecengine::{Hnsw, HnswParams, Metric};
 
 use crate::bitset::Bitset;
@@ -25,6 +26,8 @@ pub(crate) struct Segment {
     pub payloads: Vec<Vec<u8>>,
     pub deleted: Bitset,
     pub payload_index: PayloadIndex,
+    /// BM25 over the collection's text field, if it has one.
+    pub text: Bm25Index,
     /// Deletions since the .del file was last written.
     pub deleted_dirty: bool,
 }
@@ -38,6 +41,7 @@ impl Segment {
             payloads: Vec::new(),
             deleted: Bitset::default(),
             payload_index: PayloadIndex::default(),
+            text: Bm25Index::default(),
             deleted_dirty: false,
         }
     }
@@ -50,7 +54,7 @@ impl Segment {
         self.ids.len() - self.deleted.count()
     }
 
-    pub fn load(dir: &Path, id: u64) -> io::Result<Self> {
+    pub fn load(dir: &Path, id: u64, text_field: Option<&str>) -> io::Result<Self> {
         let index = Hnsw::load(path(dir, id, "hnsw"), true)?;
         let (ids, payloads) = decode_meta(&read_checked(&path(dir, id, "meta"))?)?;
         let deleted = match read_checked(&path(dir, id, "del")) {
@@ -66,6 +70,7 @@ impl Segment {
             )));
         }
         let payload_index = PayloadIndex::build(payloads.iter().map(Vec::as_slice));
+        let text = build_text_index(&payloads, text_field);
         Ok(Self {
             id: Some(id),
             index,
@@ -73,6 +78,7 @@ impl Segment {
             payloads,
             deleted,
             payload_index,
+            text,
             deleted_dirty: false,
         })
     }
@@ -104,6 +110,35 @@ impl Segment {
             let _ = fs::remove_file(path(dir, id, ext));
         }
     }
+}
+
+/// The text to index from a payload: the field's string, or its strings joined if
+/// it is an array.
+pub(crate) fn text_of(payload: &[u8], field: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    match value.get(field)? {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+pub(crate) fn build_text_index(payloads: &[Vec<u8>], field: Option<&str>) -> Bm25Index {
+    let mut index = Bm25Index::default();
+    if let Some(field) = field {
+        for (i, p) in payloads.iter().enumerate() {
+            if let Some(t) = text_of(p, field) {
+                index.add(i as u32, &t);
+            }
+        }
+    }
+    index
 }
 
 pub(crate) fn path(dir: &Path, id: u64, ext: &str) -> PathBuf {
