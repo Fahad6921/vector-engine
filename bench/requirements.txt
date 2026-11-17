@@ -5,3 +5,5 @@ maturin>=1.7,<2
 hnswlib>=0.8
 # 1.11+ only ships macOS 14+ wheels
 faiss-cpu==1.10.0
+# hybrid search eval (bench/beir.py)
+sentence-transformers>=3
